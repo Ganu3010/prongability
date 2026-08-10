@@ -58,7 +58,12 @@ def parse_args():
     p.add_argument("--output", default="./rulebook_dataset")
     p.add_argument("--num-background-vehicles", type=int, default=15)
     p.add_argument("--target-speed-kmh", type=float, default=40.0)
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--seed", type=int, default=42,
+                    help="Base seed. Each episode gets its own derived seed "
+                         "(base + episode_id) so one bad layout doesn't affect every episode.")
+    p.add_argument("--verbose", action="store_true",
+                    help="Print per-episode spawn counts, object-detection coverage, "
+                         "and ego displacement/closest-actor diagnostics")
     # roughly balance categories (a)/(b)/(c) per the spec, not baseline-dominated
     p.add_argument("--scenario-weights", nargs=3, type=float, default=[0.3, 0.3, 0.4],
                     metavar=("BASELINE_W", "NOISE_W", "ADVERSARIAL_W"))
@@ -141,8 +146,9 @@ def run_episode(world, tm, carla_map, blueprint_library, args, episode_id, town,
             actor.set_autopilot(True, tm.get_port())
             vehicle_actors.append(actor)
             bg_spawned += 1
-    print(f"  [episode {episode_id}] background vehicles: {bg_spawned}/{len(bg_spawns)} spawned "
-          f"(requested {args.num_background_vehicles}, {len(spawn_points)} total spawn points on {town})")
+    if args.verbose:
+        print(f"  [episode {episode_id}] background vehicles: {bg_spawned}/{len(bg_spawns)} spawned "
+              f"(requested {args.num_background_vehicles}, {len(spawn_points)} total spawn points on {town})")
 
     # scenario-specific actors
     scenario_state = {"triggered": False, "trigger_tick": rng.randint(20, args.frames_per_episode - 20)
@@ -153,8 +159,9 @@ def run_episode(world, tm, carla_map, blueprint_library, args, episode_id, town,
             if a:
                 vehicle_actors.append(a)
                 scenario_state["cut_in_actor"] = a
-                print(f"  [episode {episode_id}] cut_in vehicle spawned (actor {a.id}), "
-                      f"will trigger at tick {scenario_state['trigger_tick']}")
+                if args.verbose:
+                    print(f"  [episode {episode_id}] cut_in vehicle spawned (actor {a.id}), "
+                          f"will trigger at tick {scenario_state['trigger_tick']}")
             else:
                 print(f"  [episode {episode_id}] WARNING: cut_in vehicle failed to spawn "
                       f"(likely no adjacent lane at this spawn point) — episode will only have background traffic, if any")
@@ -189,7 +196,8 @@ def run_episode(world, tm, carla_map, blueprint_library, args, episode_id, town,
     world.tick()
 
     world_vehicle_count = len(world.get_actors().filter("vehicle.*"))
-    print(f"  [episode {episode_id}] total vehicle actors in world after spawning + settle tick: {world_vehicle_count}")
+    if args.verbose:
+        print(f"  [episode {episode_id}] total vehicle actors in world after spawning + settle tick: {world_vehicle_count}")
 
     # sensors
     sensor_transform = make_sensor_transform()
@@ -269,7 +277,7 @@ def run_episode(world, tm, carla_map, blueprint_library, args, episode_id, town,
             in_O = [o for o in objects if o.in_O]
             nearest_lead = min(in_O, key=lambda o: o.distance) if in_O else None
 
-            d = rulebook.closest_actor_distance(world, ego_vehicle)
+            d = rulebook.closest_actor_distance(world, ego_vehicle) if args.verbose else None
             if d is not None and (closest_ever is None or d < closest_ever):
                 closest_ever = d
 
@@ -321,14 +329,15 @@ def run_episode(world, tm, carla_map, blueprint_library, args, episode_id, town,
 
         frames_with_objects = sum(1 for r in metadata_records if len(r["objects"]) > 0)
         frames_with_in_O = sum(1 for r in metadata_records if any(o["in_O"] for o in r["objects"]))
-        ego_end_loc = ego_vehicle.get_transform().location
-        ego_displacement = ego_start_loc.distance(ego_end_loc)
         print(f"  [episode {episode_id}] {town}/{weather_name}/{scenario_type}"
               f"{'/' + scenario_name if scenario_name else ''} -> {len(metadata_records)} frames, "
               f"{frames_with_objects} with >=1 object nearby, {frames_with_in_O} with an object in_O")
-        closest_str = f"{closest_ever:.1f}m" if closest_ever is not None else "N/A (no actors detected at all)"
-        print(f"  [episode {episode_id}] ego displacement over episode: {ego_displacement:.1f}m, "
-              f"closest any-actor distance ever seen: {closest_str}")
+        if args.verbose:
+            ego_end_loc = ego_vehicle.get_transform().location
+            ego_displacement = ego_start_loc.distance(ego_end_loc)
+            closest_str = f"{closest_ever:.1f}m" if closest_ever is not None else "N/A (no actors detected at all)"
+            print(f"  [episode {episode_id}] ego displacement over episode: {ego_displacement:.1f}m, "
+                  f"closest any-actor distance ever seen: {closest_str}")
 
     finally:
         # destroy in dependency order: sensors -> controllers -> walkers -> vehicles.
@@ -416,11 +425,12 @@ def main():
 
         try:
             for _ in range(args.episodes_per_combo):
-                scenario_type = choose_scenario_type(rng, args.scenario_weights)
-                scenario_name = rng.choice(scenarios.SCENARIO_NAMES) if scenario_type == "adversarial" else None
+                episode_rng = random.Random(args.seed + episode_id)  # distinct, reproducible seed per episode
+                scenario_type = choose_scenario_type(episode_rng, args.scenario_weights)
+                scenario_name = episode_rng.choice(scenarios.SCENARIO_NAMES) if scenario_type == "adversarial" else None
                 out_dir = os.path.join(args.output, f"episode_{episode_id:04d}")
                 run_episode(world, tm, carla_map, blueprint_library, args, episode_id,
-                            town, weather_name, scenario_type, scenario_name, out_dir, rng)
+                            town, weather_name, scenario_type, scenario_name, out_dir, episode_rng)
                 episode_id += 1
         finally:
             tm.set_synchronous_mode(False)
