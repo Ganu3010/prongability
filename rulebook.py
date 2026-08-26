@@ -27,7 +27,7 @@ class ObjectRecord:
     relative_angle_deg: float  # signed angle from ego's forward vector, -180..180, 0 = straight ahead
     occlusion: str  # "none" / "partial" / "heavy"
     colliding: bool  # ego's bounding-box sweep (this tick + previous tick) intersects this actor's bbox
-    in_lane: bool  # same road_id + lane_id as ego
+    in_lane: bool  # within roughly a lane-width of the ego's heading line (lateral distance test, not road_id/lane_id topology)
     in_front: bool  # positive forward-vector projection
     in_O: bool  # in_lane and in_front (the "relevant object" set most rulebooks care about)
     distance_bucket: str = ""
@@ -193,7 +193,6 @@ def extract_object_list(world, ego_vehicle, depth_image_array, camera_actor, K, 
     ego_forward = ego_transform.get_forward_vector()
     ego_loc = ego_transform.location
     ego_velocity = ego_vehicle.get_velocity()
-    ego_wp = carla_map.get_waypoint(ego_loc)
     ego_bbox = ego_vehicle.bounding_box
 
     records = []
@@ -213,13 +212,18 @@ def extract_object_list(world, ego_vehicle, depth_image_array, camera_actor, K, 
         forward_component = dx * ego_forward.x + dy * ego_forward.y
         in_front = forward_component > 0
 
+        # Lateral offset from the ego's heading line, rather than exact
+        # road_id/lane_id topology matching. Topology matching breaks near
+        # junctions, where road_id legitimately changes over a few meters
+        # even within what's visually the same lane -- that fragility was
+        # producing near-zero in_O hits on some runs. Perpendicular
+        # distance from the actor to the infinite line through the ego's
+        # position along its forward vector (ego_forward is unit-length,
+        # so this cross product IS the perpendicular distance directly).
+        lateral_offset = abs(dx * ego_forward.y - dy * ego_forward.x)
         actor_wp = carla_map.get_waypoint(actor_loc)
-        in_lane = (
-            actor_wp is not None
-            and ego_wp is not None
-            and actor_wp.road_id == ego_wp.road_id
-            and actor_wp.lane_id == ego_wp.lane_id
-        )
+        lane_width = actor_wp.lane_width if actor_wp is not None else 3.5
+        in_lane = lateral_offset < (lane_width / 2.0 + 0.5)  # small tolerance for width/heading noise
         in_O = bool(in_front and in_lane)
 
         relative_angle_deg = _relative_angle_deg(ego_forward, dx, dy)

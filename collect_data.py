@@ -31,6 +31,7 @@ import math
 import os
 import random
 import sys
+import time
 
 import carla
 import numpy as np
@@ -350,6 +351,20 @@ def run_episode(world, tm, carla_map, blueprint_library, args, episode_id, town,
                 continue
             try:
                 actor.stop()
+            except RuntimeError as e:
+                print(f"  [episode {episode_id}] warning: failed to stop sensor {actor.id}: {e}")
+        # brief settle window: .stop() unregisters the listen callback but a
+        # callback already mid-flight on CARLA's background thread can still
+        # be executing when we call .destroy() below -- that race is what's
+        # been producing the uncatchable std::terminate crashes between
+        # combos. A tick (and a short sleep) doesn't fully eliminate the
+        # race, but shrinks the window a lot in practice.
+        world.tick()
+        time.sleep(0.1)
+        for actor in sensor_actors:
+            if not actor.is_alive:
+                continue
+            try:
                 actor.destroy()
             except RuntimeError as e:
                 print(f"  [episode {episode_id}] warning: failed to destroy sensor {actor.id}: {e}")
@@ -424,7 +439,33 @@ def main():
         world.apply_settings(settings)
 
         try:
-            for _ in range(args.episodes_per_combo):
+            all_existing = sorted(
+                d for d in os.listdir(args.output)
+                if d.startswith("episode_") and os.path.isfile(os.path.join(args.output, d, "metadata.json"))
+            )
+            all_existing_ids = [int(d.split("_")[1]) for d in all_existing]
+            next_episode_id = (max(all_existing_ids) + 1) if all_existing_ids else 0
+
+            # Count only episodes matching THIS combo (map + weather_preset) --
+            # matters when multiple combos share one --output directory (the
+            # direct multi-combo invocation case), where a flat count of all
+            # episode_* dirs would conflate episodes belonging to other combos.
+            n_existing_this_combo = 0
+            for d in all_existing:
+                try:
+                    with open(os.path.join(args.output, d, "metadata.json")) as f:
+                        recs = json.load(f)
+                    if recs and recs[0].get("map") == town and recs[0].get("weather_preset") == weather_name:
+                        n_existing_this_combo += 1
+                except (json.JSONDecodeError, IndexError, KeyError):
+                    continue
+
+            n_to_collect = max(0, args.episodes_per_combo - n_existing_this_combo)
+            if n_existing_this_combo:
+                print(f"  {town}/{weather_name}: found {n_existing_this_combo} existing episode(s) for this combo "
+                      f"already in {args.output}, collecting {n_to_collect} more (resuming at episode_id {next_episode_id})")
+            episode_id = next_episode_id
+            for _ in range(n_to_collect):
                 episode_rng = random.Random(args.seed + episode_id)  # distinct, reproducible seed per episode
                 scenario_type = choose_scenario_type(episode_rng, args.scenario_weights)
                 scenario_name = episode_rng.choice(scenarios.SCENARIO_NAMES) if scenario_type == "adversarial" else None
@@ -436,7 +477,11 @@ def main():
             tm.set_synchronous_mode(False)
             world.apply_settings(original_settings)
 
-    print(f"\nDone. {episode_id} episodes written to {args.output}")
+    total_episodes = len([
+        d for d in os.listdir(args.output)
+        if d.startswith("episode_") and os.path.isfile(os.path.join(args.output, d, "metadata.json"))
+    ])
+    print(f"\nDone. {total_episodes} episode(s) now present in {args.output}")
     print("Run postprocess.py --dataset <output dir> to get stratification coverage and an episode-level split.")
 
 
